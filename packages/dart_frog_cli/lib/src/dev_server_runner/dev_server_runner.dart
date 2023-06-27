@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
 
@@ -39,10 +40,20 @@ final _dartVmServiceAlreadyInUseErrorRegex = RegExp(
   multiLine: true,
 );
 
-// TODO(renancaraujo): Add reload and stop methods.
+// TODO(renancaraujo): Add reload method.
 /// {@template dev_server_runner}
 /// A class that manages a local development server process lifecycle.
 /// {@endtemplate}
+///
+/// The [DevServerRunner] is responsible for:
+/// - Generating the dev server runtime code.
+/// - Starting the dev server process.
+/// - Watching for file changes.
+/// - Restarting the dev server process when files change.
+/// - Stopping the dev server process when requested or under external
+/// circumstances (server process killed or watcher stopped).
+///
+/// After stopped, a [DevServerRunner] instance cannot be restarted.
 class DevServerRunner {
   /// {@macro dev_server_runner}
   DevServerRunner({
@@ -58,9 +69,7 @@ class DevServerRunner {
     @visibleForTesting io.ProcessSignal? sigint,
     @visibleForTesting ProcessStart? startProcess,
     @visibleForTesting ProcessRun? runProcess,
-    @visibleForTesting Exit? exit,
   })  : _directoryWatcher = directoryWatcher ?? DirectoryWatcher.new,
-        _exit = exit ?? io.exit,
         _isWindows = isWindows ?? io.Platform.isWindows,
         _sigint = sigint ?? io.ProcessSignal.sigint,
         _startProcess = startProcess ?? io.Process.start,
@@ -92,16 +101,34 @@ class DevServerRunner {
   final ProcessStart _startProcess;
   final ProcessRun _runProcess;
   final RestorableDirectoryGeneratorTargetBuilder _generatorTarget;
-  final Exit _exit;
   final bool _isWindows;
-
   final io.ProcessSignal _sigint;
-  late final _target = _generatorTarget(
-    io.Directory(path.join(workingDirectory.path, '.dart_frog')),
-    logger: logger,
+
+  late final _generatedDirectory = io.Directory(
+    path.join(workingDirectory.path, '.dart_frog'),
   );
+  late final _target = _generatorTarget(_generatedDirectory, logger: logger);
 
   var _isReloading = false;
+  io.Process? _serverProcess;
+  StreamSubscription<WatchEvent>? _watcherSubscription;
+
+  /// Whether the dev server is running.
+  bool get isServerRunning => _serverProcess != null;
+
+  /// Whether the dev server is watching for file changes.
+  bool get isWatching => _watcherSubscription != null;
+
+  /// Whether the dev server has been started and stopped.
+  bool get isCompleted => _exitCodeCompleter.isCompleted;
+
+  final Completer<ExitCode> _exitCodeCompleter = Completer<ExitCode>();
+
+  /// A [Future] that completes when the dev server stops.
+  ///
+  /// The [Future] will complete with the [ExitCode] indicating the conditions
+  /// under which the dev server ended.
+  Future<ExitCode> get exitCode => _exitCodeCompleter.future;
 
   Future<void> _codegen() async {
     logger.detail('[codegen] running pre-gen...');
@@ -129,8 +156,15 @@ class DevServerRunner {
     logger.detail('[codegen] reload complete.');
   }
 
-  Future<void> _killProcess(io.Process process) async {
+  // Internal method to kill the server process.
+  // Make sure to call `stop` after calling this method to also stop the
+  // watcher.
+  Future<void> _killServerProcess() async {
     _isReloading = false;
+    final process = _serverProcess;
+    if (process == null) {
+      return;
+    }
     logger.detail('[process] killing process...');
     if (_isWindows) {
       logger.detail('[process] taskkill /F /T /PID ${process.pid}');
@@ -139,33 +173,73 @@ class DevServerRunner {
       logger.detail('[process] process.kill()...');
       process.kill();
     }
+    _serverProcess = null;
     logger.detail('[process] killing process complete.');
   }
 
-  // TODO(renancaraujo): this method returns a future that completes when the
-  // process is killed, but it should return a future that completes when the
-  // process is finished starting.
-  /// Starts the development server.
-  Future<ExitCode> start() async {
+  // Internal method to cancel the watcher subscription.
+  // Make sure to call `stop` after calling this method to also stop the
+  // server process.
+  Future<void> _cancelWatcherSubscription() async {
+    if (!isWatching) {
+      return;
+    }
+    logger.detail('[watcher] cancelling subscription...');
+    await _watcherSubscription!.cancel();
+    _watcherSubscription = null;
+    logger.detail('[watcher] cancelling subscription complete.');
+  }
+
+  /// Starts the development server and a watcher that will regenerate the
+  /// server code when files change.
+  ///
+  /// This method will throw a [DartFrogDevServerException] if called while
+  /// the dev server has been started.
+  /// This method will throw a [DartFrogDevServerException] if called after
+  /// [stop] has been called.
+  Future<void> start() async {
+    if (isCompleted) {
+      throw DartFrogDevServerException(
+        'Cannot start a dev server after it has been stopped.',
+      );
+    }
+
+    if (isServerRunning) {
+      throw DartFrogDevServerException(
+        'Cannot start a dev server while already running.',
+      );
+    }
+
+    if (isWatching) {
+      throw DartFrogDevServerException(
+        'Cannot start a dev server while already watching.',
+      );
+    }
+
     var isHotReloadingEnabled = false;
 
     Future<void> serve() async {
       final enableVmServiceFlag = '--enable-vm-service=$dartVmServicePort';
 
-      logger.detail(
-        '''[process] dart $enableVmServiceFlag ${path.join('.dart_frog', 'server.dart')}''',
+      final serverDartFilePath = path.join(
+        _generatedDirectory.absolute.path,
+        'server.dart',
       );
 
-      final process = await _startProcess(
+      logger.detail(
+        '''[process] dart $enableVmServiceFlag $serverDartFilePath''',
+      );
+
+      final process = _serverProcess = await _startProcess(
         'dart',
-        [enableVmServiceFlag, path.join('.dart_frog', 'server.dart')],
+        [enableVmServiceFlag, serverDartFilePath],
         runInShell: true,
       );
 
       // On Windows listen for CTRL-C and use taskkill to kill
       // the spawned process along with any child processes.
       // https://github.com/dart-lang/sdk/issues/22470
-      if (_isWindows) _sigint.watch().listen((_) => _killProcess(process));
+      if (_isWindows) _sigint.watch().listen((_) => _killServerProcess());
 
       var hasError = false;
       process.stderr.listen((_) async {
@@ -194,9 +268,10 @@ class DevServerRunner {
 
         if ((!isHotReloadingEnabled && !isSDKWarning) ||
             isDartVMServiceAlreadyInUseError) {
-          await _killProcess(process);
-          logger.detail('[process] exit(1)');
-          _exit(1);
+          await _killServerProcess();
+          logger.detail('[process] exit(70)');
+          await stop(ExitCode.software);
+          return;
         }
 
         await _target.rollback();
@@ -211,6 +286,12 @@ class DevServerRunner {
         if (shouldCacheSnapshot) _target.cacheLatestSnapshot();
         hasError = false;
       });
+
+      process.exitCode.then((code) async {
+        logger.detail('[process] exit($code)');
+        await _killServerProcess();
+        await stop(ExitCode.software);
+      }).ignore();
     }
 
     final progress = logger.progress('Serving');
@@ -235,13 +316,50 @@ class DevServerRunner {
     }
 
     final watcher = _directoryWatcher(path.join(cwdPath));
-    final subscription = watcher.events
+    _watcherSubscription = watcher.events
         .where(shouldReload)
         .debounce(Duration.zero)
         .listen((_) => _reload());
 
-    await subscription.asFuture<void>();
-    await subscription.cancel();
-    return ExitCode.success;
+    _watcherSubscription!.asFuture<void>().then((_) async {
+      await _cancelWatcherSubscription();
+      await stop();
+    }).catchError((_) async {
+      await _cancelWatcherSubscription();
+      await stop(ExitCode.software);
+    }).ignore();
   }
+
+  /// Stops the development server and the watcher then
+  /// completes [DevServerRunner.exitCode] with the given [exitCode].
+  ///
+  /// If [exitCode] is not provided, it defaults to [ExitCode.success].
+  Future<void> stop([ExitCode exitCode = ExitCode.success]) async {
+    if (isCompleted) {
+      return;
+    }
+
+    if (isWatching) {
+      await _cancelWatcherSubscription();
+    }
+    if (isServerRunning) {
+      await _killServerProcess();
+    }
+
+    _exitCodeCompleter.complete(exitCode);
+  }
+}
+
+/// {@template dart_frog_dev_server_exception}
+/// Exception thrown when the dev server fails to start.
+/// {@endtemplate}
+class DartFrogDevServerException implements Exception {
+  /// {@macro dart_frog_dev_server_exception}
+  DartFrogDevServerException(this.message);
+
+  /// The exception message.
+  final String message;
+
+  @override
+  String toString() => message;
 }
