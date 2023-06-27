@@ -190,8 +190,8 @@ class DevServerRunner {
     logger.detail('[watcher] cancelling subscription complete.');
   }
 
-  /// Starts the development server and a watcher that will regenerate the
-  /// server code when files change.
+  /// Starts the development server and a [DirectoryWatcher] subscription
+  /// that will regenerate the dev server code when files change.
   ///
   /// This method will throw a [DartFrogDevServerException] if called while
   /// the dev server has been started.
@@ -216,9 +216,8 @@ class DevServerRunner {
       );
     }
 
-    var isHotReloadingEnabled = false;
-
     Future<void> serve() async {
+      var isHotReloadingEnabled = false;
       final enableVmServiceFlag = '--enable-vm-service=$dartVmServicePort';
 
       final serverDartFilePath = path.join(
@@ -334,6 +333,8 @@ class DevServerRunner {
   /// completes [DevServerRunner.exitCode] with the given [exitCode].
   ///
   /// If [exitCode] is not provided, it defaults to [ExitCode.success].
+  ///
+  /// After calling [stop], the dev server cannot be restarted.
   Future<void> stop([ExitCode exitCode = ExitCode.success]) async {
     if (isCompleted) {
       return;
@@ -347,6 +348,14 @@ class DevServerRunner {
     }
 
     _exitCodeCompleter.complete(exitCode);
+  }
+
+  /// Regenerates the dev server code and sends a hot reload signal to the
+  /// server.
+  Future<void> reload() async {
+    if (isCompleted) return;
+    if (!isServerRunning) return;
+    return _reload();
   }
 }
 
