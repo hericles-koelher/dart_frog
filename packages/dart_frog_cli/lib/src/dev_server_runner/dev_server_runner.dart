@@ -40,10 +40,8 @@ final _dartVmServiceAlreadyInUseErrorRegex = RegExp(
   multiLine: true,
 );
 
-// TODO(renancaraujo): Add reload method.
 /// {@template dev_server_runner}
 /// A class that manages a local development server process lifecycle.
-/// {@endtemplate}
 ///
 /// The [DevServerRunner] is responsible for:
 /// - Generating the dev server runtime code.
@@ -54,6 +52,7 @@ final _dartVmServiceAlreadyInUseErrorRegex = RegExp(
 /// circumstances (server process killed or watcher stopped).
 ///
 /// After stopped, a [DevServerRunner] instance cannot be restarted.
+/// {@endtemplate}
 class DevServerRunner {
   /// {@macro dev_server_runner}
   DevServerRunner({
@@ -335,6 +334,9 @@ class DevServerRunner {
   /// If [exitCode] is not provided, it defaults to [ExitCode.success].
   ///
   /// After calling [stop], the dev server cannot be restarted.
+  ///
+  /// This can be called internally if the server process is killed or if the
+  /// watcher stops watching.
   Future<void> stop([ExitCode exitCode = ExitCode.success]) async {
     if (isCompleted) {
       return;
