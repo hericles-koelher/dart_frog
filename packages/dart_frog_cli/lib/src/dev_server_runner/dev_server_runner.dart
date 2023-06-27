@@ -323,6 +323,9 @@ class DevServerRunner {
       await _cancelWatcherSubscription();
       await stop();
     }).catchError((_) async {
+      throw DartFrogDevServerException(
+        'The watcher subscription has been cancelled. $_',
+      );
       await _cancelWatcherSubscription();
       await stop(ExitCode.software);
     }).ignore();
